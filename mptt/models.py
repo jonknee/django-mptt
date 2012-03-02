@@ -6,7 +6,7 @@ from django.db.models.base import ModelBase
 from django.db.models.query import Q
 from django.utils.translation import ugettext as _
 
-from mptt.fields import TreeForeignKey
+from mptt.fields import TreeForeignKey, TreeOneToOneField, TreeManyToManyField
 from mptt.managers import TreeManager
 from mptt.utils import _exists
 
@@ -22,12 +22,14 @@ class MPTTOptions(object):
     """
 
     order_insertion_by = []
-    tree_manager_attr = 'objects'
     left_attr = 'lft'
     right_attr = 'rght'
     tree_id_attr = 'tree_id'
     level_attr = 'level'
     parent_attr = 'parent'
+
+    # deprecated, don't use this
+    tree_manager_attr = 'tree'
 
     def __init__(self, opts=None, **kwargs):
         # Override defaults with options provided
@@ -165,7 +167,23 @@ class MPTTModelBase(ModelBase):
          - adds the MPTT fields to the class
          - adds a TreeManager to the model
         """
-        class_dict['_mptt_meta'] = MPTTOptions(class_dict.pop('MPTTMeta', None))
+        MPTTMeta = class_dict.pop('MPTTMeta', None)
+        if not MPTTMeta:
+            class MPTTMeta:
+                pass
+
+        initial_options = set(dir(MPTTMeta))
+
+        # extend MPTTMeta from base classes
+        for base in bases:
+            if hasattr(base, '_mptt_meta'):
+                for (name, value) in base._mptt_meta:
+                    if name == 'tree_manager_attr':
+                        continue
+                    if name not in initial_options:
+                        setattr(MPTTMeta, name, value)
+
+        class_dict['_mptt_meta'] = MPTTOptions(MPTTMeta)
         cls = super(MPTTModelBase, meta).__new__(meta, class_name, bases, class_dict)
 
         return meta.register(cls)
@@ -184,6 +202,32 @@ class MPTTModelBase(ModelBase):
             cls._mptt_meta = MPTTOptions(**kwargs)
 
         abstract = getattr(cls._meta, 'abstract', False)
+
+        # For backwards compatibility with existing libraries, we copy the
+        # _mptt_meta options into _meta.
+        # This was removed in 0.5 but added back in 0.5.1 since it caused compatibility
+        # issues with django-cms 2.2.0.
+        # some discussion is here: https://github.com/divio/django-cms/issues/1079
+        # This stuff is still documented as removed, and WILL be removed again in the next release.
+        # All new code should use _mptt_meta rather than _meta for tree attributes.
+        attrs = set(['left_attr', 'right_attr', 'tree_id_attr', 'level_attr', 'parent_attr',
+                    'tree_manager_attr', 'order_insertion_by'])
+        warned_attrs = set()
+
+        class _MetaSubClass(cls._meta.__class__):
+            def __getattr__(self, attr):
+                if attr in attrs:
+                    if attr not in warned_attrs:
+                        warnings.warn(
+                            "%s._meta.%s is deprecated and will be removed in mptt 0.6"
+                            % (cls.__name__, attr),
+                            #don't use DeprecationWarning, that gets ignored by default
+                            UserWarning,
+                        )
+                        warned_attrs.add(attr)
+                    return getattr(cls._mptt_meta, attr)
+                return super(_MetaSubClass, self).__getattr__(attr)
+        cls._meta.__class__ = _MetaSubClass
 
         try:
             MPTTModel
@@ -217,18 +261,55 @@ class MPTTModelBase(ModelBase):
 
             # Add a tree manager, if there isn't one already
             if not abstract:
-                tree_manager_attr = cls._mptt_meta.tree_manager_attr
-                manager = getattr(cls, tree_manager_attr, None)
-                if not manager:
-                    manager = cls._default_manager
-                if not isinstance(manager, TreeManager):
-                    manager = TreeManager()
+                manager = getattr(cls, 'objects', None)
+                if manager is None:
+                    manager = cls._default_manager._copy_to_model(cls)
+                    manager.contribute_to_class(cls, 'objects')
                 elif manager.model != cls:
+                    # manager was inherited
                     manager = manager._copy_to_model(cls)
-                manager.contribute_to_class(cls, tree_manager_attr)
-                manager.init_from_model(cls)
+                    manager.contribute_to_class(cls, 'objects')
+                if hasattr(manager, 'init_from_model'):
+                    manager.init_from_model(cls)
 
-                setattr(cls, '_tree_manager', manager)
+                # make sure we have a tree manager somewhere
+                tree_manager = TreeManager()
+                tree_manager.contribute_to_class(cls, '_tree_manager')
+                tree_manager.init_from_model(cls)
+
+                # avoid using ManagerDescriptor, so instances can refer to self._tree_manager
+                setattr(cls, '_tree_manager', tree_manager)
+
+                # for backwards compatibility, add .tree too (or whatever's in tree_manager_attr)
+                tree_manager_attr = cls._mptt_meta.tree_manager_attr
+                if tree_manager_attr != 'objects':
+                    another = getattr(cls, tree_manager_attr, None)
+                    if another is None:
+                        # wrap with a warning on first use
+                        from django.db.models.manager import ManagerDescriptor
+
+                        class _WarningDescriptor(ManagerDescriptor):
+                            def __init__(self, manager):
+                                self.manager = manager
+                                self.used = False
+
+                            def __get__(self, instance, type=None):
+                                if instance != None:
+                                    raise AttributeError("Manager isn't accessible via %s instances" % type.__name__)
+
+                                if not self.used:
+                                    warnings.warn(
+                                        'Implicit manager %s.%s will be removed in django-mptt 0.6. '
+                                        ' Explicitly define a TreeManager() on your model to remove this warning.'
+                                        % (cls.__name__, tree_manager_attr),
+                                        DeprecationWarning
+                                    )
+                                    self.used = True
+                                return self.manager
+
+                        setattr(cls, tree_manager_attr, _WarningDescriptor(manager))
+                    elif hasattr(another, 'init_from_model'):
+                        another.init_from_model(cls)
 
         return cls
 
@@ -306,9 +387,10 @@ class MPTTModel(models.Model):
         If called from a template where the tree has been walked by the
         ``cache_tree_children`` filter, no database query is required.
         """
-
         if hasattr(self, '_cached_children'):
-            return self._cached_children
+            qs = self._tree_manager.filter(pk__in=[n.pk for n in self._cached_children])
+            qs._result_cache = self._cached_children
+            return qs
         else:
             if self.is_leaf_node():
                 return self._tree_manager.none()
@@ -514,7 +596,7 @@ class MPTTModel(models.Model):
         self._tree_manager.move_node(self, target, position)
 
     def _is_saved(self, using=None):
-        if not self.pk:
+        if not self.pk or self._mpttfield('tree_id') is None:
             return False
         opts = self._meta
         if opts.pk.rel is None:
@@ -522,6 +604,7 @@ class MPTTModel(models.Model):
         else:
             if not hasattr(self, '_mptt_saved'):
                 manager = self.__class__._base_manager
+                # NOTE we don't support django 1.1 anymore, so this is likely to get removed soon
                 if hasattr(manager, 'using'):
                     # multi db support was added in django 1.2
                     manager = manager.using(using)
